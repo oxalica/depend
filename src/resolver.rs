@@ -205,3 +205,132 @@ impl fmt::Debug for CycleDepError {
         f.debug_struct("CycleDepError").finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::evaluator::Value;
+
+    type RefVec<'t> = Rc<RefCell<Vec<UnitRef<'t, Dep<'t>>>>>;
+
+    struct Dep<'t> {
+        cnt: Rc<RefCell<(usize, usize)>>,
+        v:   RefVec<'t>,
+        idx: Option<usize>,
+        b:   i32,
+    }
+
+    impl<'t> Evaluator<'t> for Dep<'t> {
+        type Value = i32;
+        fn eval(&self, r: &mut Require<'t>) -> i32 {
+            self.cnt.borrow_mut().0 += 1;
+            self.idx.map_or(self.b, |idx| {
+                match r.require(&self.v.borrow()[idx]) {
+                    Ok(&x) if x != 42 => x + self.b,
+                    _ => 42,
+                }
+            })
+        }
+    }
+
+    impl<'t> Drop for Dep<'t> {
+        fn drop(&mut self) {
+            self.cnt.borrow_mut().1 += 1;
+        }
+    }
+
+    fn get_ans<'t>(res: &Resolver<'t>, v: &RefVec<'t>) -> Vec<i32> {
+        v.borrow().iter()
+          .map(|u| *res.get(u))
+          .collect()
+    }
+
+    fn get_cnt(c: &Rc<RefCell<(usize, usize)>>) -> (usize, usize) {
+        use std::mem::replace;
+        replace(&mut c.borrow_mut(), (0, 0))
+    }
+
+    #[test]
+    fn basic_test() {
+        let cnt = Rc::new(RefCell::new((0, 0)));
+        let _keep;
+
+        {
+            let v = Rc::new(RefCell::new(vec![]));
+            let mut res = Resolver::<'static>::new();
+            let dep = |idx, b| Dep { cnt: cnt.clone(), v: v.clone(), idx, b };
+
+            res.with(|res| {
+                let mut mv = v.borrow_mut();
+                mv.push(res.new_unit(dep(None, 1)));
+                mv.push(res.new_unit(dep(Some(0), 1)));
+                mv.push(res.new_unit(dep(None, 3)));
+
+                assert_eq!(get_cnt(&cnt), (0, 0));
+            });
+            assert_eq!(get_cnt(&cnt), (3, 0)); // Eval [0], [1], [2]
+            assert_eq!(get_ans(&res, &v), [1, 2, 3]);
+            assert_eq!(get_cnt(&cnt), (0, 0)); // Use cache
+            assert_eq!(get_ans(&res, &v), [1, 2, 3]);
+            assert_eq!(get_cnt(&cnt), (0, 0)); // Still cache
+
+            res.with(|res| {
+                res.set(&v.borrow()[0], dep(None, 2));
+                assert_eq!(get_cnt(&cnt), (0, 1)); // Drop the old
+            });
+            assert_eq!(get_cnt(&cnt), (2, 0)); // re-eval [0], [1]
+            assert_eq!(get_ans(&res, &v), [2, 3, 3]);
+
+            res.with(|res| {
+                res.set(&v.borrow()[0], dep(Some(1), 1));
+                assert_eq!(get_cnt(&cnt), (0, 1)); // Drop the old
+            });
+            assert_eq!(get_cnt(&cnt), (2, 0)); // Re-eval [0], [1]
+            assert_eq!(get_ans(&res, &v), [42, 42, 3]);
+
+            _keep = v.borrow()[2].clone();
+            v.borrow_mut().pop();
+            assert_eq!(get_cnt(&cnt), (0, 0)); // `_keep` still hold it
+            v.borrow_mut().pop();
+            assert_eq!(get_cnt(&cnt), (0, 1)); // Drop if no references,
+            v.borrow_mut().clear();            // regardless of dependencies
+            assert_eq!(get_cnt(&cnt), (0, 1));
+        }
+        assert_eq!(get_cnt(&cnt), (0, 0)); // FIXME: Resolver is already died.
+        drop(_keep);
+        assert_eq!(get_cnt(&cnt), (0, 1));
+    }
+
+    #[test]
+    fn closure_test() {
+        let eval_count = Rc::new(RefCell::new(0));
+
+        let mut a = None;
+        let mut res = Resolver::<'static>::new();
+        let (mut b, mut c) = (None, None);
+        res.with(|res| {
+            a = Some(res.new_unit(Value::new(1)));
+            let (a_, eval_count_) = (a.clone().unwrap(), eval_count.clone());
+            // b = Some(res.new_unit(move |r| { // Fail to infer
+            // b = Some(res.new_unit(move |r: &mut Require| { // Fail to infer
+            b = Some(res.new_unit(move |r: &mut Require<'static>| {
+                *eval_count_.borrow_mut() += 1;
+                let x = *r.require(&a_).unwrap();
+                (x, x + 1)
+            }));
+            c = Some(res.new_unit(Value::new(3)));
+
+            assert_eq!(*eval_count.borrow(), 0); // Not resolved now
+        });
+        assert_eq!(*eval_count.borrow(), 1);
+        assert_eq!(res.get(&a.as_ref().unwrap()), &1);
+        assert_eq!(res.get(&b.as_ref().unwrap()), &(1, 2));
+        assert_eq!(res.get(&c.as_ref().unwrap()), &3);
+
+        res.with(|res| res.set(&a.as_ref().unwrap(), Value::new(11)));
+        assert_eq!(*eval_count.borrow(), 2);
+        assert_eq!(res.get(&a.as_ref().unwrap()), &11);
+        assert_eq!(res.get(&b.as_ref().unwrap()), &(11, 12));
+        assert_eq!(res.get(&c.as_ref().unwrap()), &3);
+    }
+}
