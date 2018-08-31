@@ -8,7 +8,3 @@ name = "depend"
 path = "src/lib.rs"
 
 [dependencies]
-
-[dependencies.clippy]
-version = "*"
-optional = true
