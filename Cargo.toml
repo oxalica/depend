@@ -2,6 +2,8 @@
 name = "depend"
 version = "0.1.0"
 authors = ["uHOOCCOOHu <hooccooh1896@gmail.com>"]
+description = "WIP: Dynamic incremental dependency resolving library"
+license = "MIT"
 
 [lib]
 name = "depend"
